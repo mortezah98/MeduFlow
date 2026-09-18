@@ -86,7 +86,7 @@ class MainActivity : AppCompatActivity(), FlowEngine.Host {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        webView.setSupportMultipleWindows(false)
+        webView.settings.setSupportMultipleWindows(false)
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val url = request.url.toString()
