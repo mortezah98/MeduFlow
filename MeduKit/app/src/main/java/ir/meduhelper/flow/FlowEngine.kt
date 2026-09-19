@@ -23,6 +23,8 @@ class FlowEngine(
         SSO_CHALLENGE("مرحله ۲ از ۶", "این مرحله کپچای تعاملی است — لطفاً خودتان کامل کنید."),
         SSO_OTP("مرحله ۳ از ۶", "کد ۵ رقمی پیامک‌شده به‌صورت خودکار وارد می‌شود؛ اگر نیامد، دستی بنویسید و تایید را بزنید."),
         PORTAL_LOGGED(null, "ورود موفق ✔ در حال انتقال به سامانهٔ نماد…"),
+        NEED_LOGIN(null, "در حال هدایت به صفحه ورود…"),
+        MANUAL_NAMAD("مرحله ۴ از ۶", "انتقال خودکار انجام نشد. در همین صفحه آیکون «نماد» را پیدا و لمس کنید."),
         NAMAD_ACCOUNTS("مرحله ۴ از ۶", "کارت مدرسهٔ فرزندتان را پیدا کنید و «ورود به عنوان والدین» را بزنید."),
         NAMAD_DASHBOARD("مرحله ۵ از ۶", "روی آیکون «آزمون» بزنید."),
         NAMAD_TEST_LIST("مرحله ۶ از ۶", "آزمون موردنظر را از فهرست انتخاب کنید. (پایان نسخهٔ فعلی)"),
@@ -37,6 +39,10 @@ class FlowEngine(
     private var jumpPending = false
     private var otpAsked = false
     private var tickCount = 0
+    private var manualMode = false
+    private var ssoCompleted = false
+    private var namadSince = 0L
+    private var needLoginNav = false
     private val handler = Handler(Looper.getMainLooper())
     private var running = false
 
@@ -44,8 +50,6 @@ class FlowEngine(
         override fun run() {
             if (!running) return
             tickCount++
-            // هر ~۲ ثانیه یک‌بار نشان‌ها دوباره اعمال می‌شوند تا اگر صفحه SPA خودش را
-            // از نو رندر کرد، هایلایت‌ها از دست نروند
             probeAndAct(tickCount % 3 == 0)
             handler.postDelayed(this, 700)
         }
@@ -69,7 +73,39 @@ class FlowEngine(
             if (raw == null || raw == "null") return@evaluateJavascript
             val p = try { JSONObject(raw) } catch (e: Exception) { return@evaluateJavascript }
             val st = detect(url, p)
-            if (st != state || url != lastAppliedUrl || force) {
+
+            // نشانه‌های جریان واقعی ورود SSO
+            when (st) {
+                St.SSO_OTP -> ssoCompleted = true
+                St.SSO_LOGIN, St.SSO_CHALLENGE -> ssoCompleted = false
+                else -> {}
+            }
+
+            // نماد با موفقیت و با محتوا لود شد → خروج از حالت دستی
+            if (st == St.NAMAD_ACCOUNTS && p.optBoolean("schoolCards")) {
+                manualMode = false
+                namadSince = 0
+            }
+
+            // صفحهٔ نماد بیش از ۲۰ ثانیه خالی ماند → بازگشت به روش مطمئن
+            if (st == St.NAMAD_ACCOUNTS) {
+                if (namadSince == 0L) namadSince = System.currentTimeMillis()
+                if (!manualMode && !p.optBoolean("schoolCards") &&
+                    System.currentTimeMillis() - namadSince > 20000
+                ) {
+                    manualMode = true
+                    namadSince = 0
+                    host.toast("بارگذاری خودکار نماد ناموفق بود — بازگشت به روش دستی")
+                    webView.loadUrl(
+                        if (ssoCompleted) "https://my.medu.ir/"
+                        else "https://my.medu.ir/login.html"
+                    )
+                    return@evaluateJavascript
+                }
+            }
+
+            val entered = st != state
+            if (entered || url != lastAppliedUrl || force) {
                 state = st
                 lastAppliedUrl = url
                 applyState(st, url)
@@ -87,8 +123,12 @@ class FlowEngine(
             h == "namad.medu.ir" && url.contains("my-accounts")      -> St.NAMAD_ACCOUNTS
             h == "namad.medu.ir" && url.contains("advisory-test")    -> St.NAMAD_TEST_LIST
             h == "namad.medu.ir" && url.contains("/dashboard/")      -> St.NAMAD_DASHBOARD
-            h.endsWith("my.medu.ir")                                 -> St.PORTAL_LOGGED
-            else                                                     -> St.UNKNOWN
+            h.endsWith("my.medu.ir") -> when {
+                manualMode   -> St.MANUAL_NAMAD
+                ssoCompleted -> St.PORTAL_LOGGED
+                else         -> St.NEED_LOGIN
+            }
+            else -> St.UNKNOWN
         }
     }
 
@@ -124,11 +164,26 @@ class FlowEngine(
             }
             St.PORTAL_LOGGED -> {
                 val msg = if (jumpCount >= 2)
-                    "انتقال خودکار انجام نشد — لطفاً از همین صفحه، کارت یا آیکون «نماد» را پیدا و لمس کنید."
+                    "انتقال خودکار انجام نشد — لطفاً از همین صفحه کارت یا آیکون «نماد» را پیدا و لمس کنید."
                 else st.message
                 host.onGuide(st.name, true, null, msg)
                 run(PRELUDE)
                 maybeJumpToNamad()
+            }
+            St.NEED_LOGIN -> {
+                host.onGuide(st.name, true, null, st.message)
+                run(PRELUDE)
+                if (!needLoginNav) {
+                    needLoginNav = true
+                    handler.postDelayed({
+                        needLoginNav = false
+                        if (state == St.NEED_LOGIN) webView.loadUrl("https://my.medu.ir/login.html")
+                    }, 1000)
+                }
+            }
+            St.MANUAL_NAMAD -> {
+                host.onGuide(st.name, true, st.stepLabel, st.message)
+                run(PRELUDE + MANUAL_NAMAD_JS)
             }
             St.NAMAD_ACCOUNTS -> {
                 val school = savedSchool()
@@ -150,7 +205,7 @@ class FlowEngine(
     }
 
     private fun maybeJumpToNamad() {
-        if (jumpCount >= 2 || jumpPending) return
+        if (manualMode || jumpCount >= 2 || jumpPending) return
         jumpPending = true
         handler.postDelayed({
             jumpPending = false
@@ -193,6 +248,7 @@ class FlowEngine(
     person:q('#person'),
     mobile:q('#mobile'),
     otp: otps>0,
+    schoolCards: ((document.body&&document.body.innerText)||'').indexOf('ورود به عنوان والدین')>-1,
     testIcon: q('a[href*="advisory-test"]')
   };
 })()""".trimIndent()
@@ -313,5 +369,9 @@ __mshStyle(); __mshClear();
     private val NAMAD_DASHBOARD_JS = """(function(){
   var t=document.querySelector('a[href*="advisory-test"]');
   if(t) t.classList.add('msh-pulse');
+})();""".trimIndent()
+
+    private val MANUAL_NAMAD_JS = """(function(){
+  __mshInnermost('نماد').forEach(function(e){ e.classList.add('msh-pulse'); });
 })();""".trimIndent()
 }
